@@ -127,6 +127,18 @@
 
 /* Some constants, as macros. */
 /**
+ * Fine-structure constant
+ */
+#define ALPHA_EM 7.2973525693E-03
+/**
+ * Planck constant in GeV m.
+ */
+#define HBAR_C 1.973269804E-16
+/**
+ * Bohr radius in m.
+ */
+#define BOHR_RADIUS 0.529177210903E-10
+/**
  * The muon decay length in m.
  */
 #define MUON_C_TAU 658.654
@@ -978,17 +990,15 @@ static enum pumas_return error_format(struct error_context * context,
 /**
  * Routines for the Coulomb scattering and Transverse Transport (TT).
  */
-static void coulomb_screening_parameters(const struct pumas_physics * physics,
-    struct pumas_context * context, double kinetic, int element,
-    double * screening);
+static void coulomb_screening_parameters(double Z, double A, double m,
+    double kinetic, double * screening);
 static double coulomb_wentzel_path(const struct pumas_physics * physics,
     double kinetic, double Z, double A, double screening);
 static double coulomb_ehs_length(const struct pumas_physics * physics,
     struct pumas_context * context, int material, double kinetic);
-static double coulomb_spin_factor(
-    const struct pumas_physics * physics, double kinetic);
-static void coulomb_frame_parameters(const struct pumas_physics * physics,
-    double kinetic, double Ma, double * kinetic0, double * parameters);
+static double coulomb_spin_factor(double mass, double kinetic);
+static void coulomb_frame_parameters(double Z, double A, double mass,
+    double kinetic, double * kinetic0, double * parameters);
 static void coulomb_pole_decomposition(
     double * screening, double * a, double * b);
 static double coulomb_restricted_cs(
@@ -2670,11 +2680,12 @@ enum pumas_return pumas_physics_property_scattering_length(
                 const struct atomic_element * element =
                     physics->element[component->element];
                 double kinetic0, screening[3], coefficient[2], fCM[2];
-                coulomb_frame_parameters(
-                    physics, kinetic, element->A, &kinetic0, fCM);
-                coulomb_screening_parameters(
-                    physics, NULL, kinetic0, component->element, screening);
-                const double fspin = coulomb_spin_factor(physics, kinetic0);
+                coulomb_frame_parameters(element->Z, element->A, physics->mass,
+                    kinetic, &kinetic0, fCM);
+                coulomb_screening_parameters(element->Z, element->A,
+                    physics->mass, kinetic0, screening);
+                const double fspin = coulomb_spin_factor(
+                    physics->mass, kinetic0);
                 double a[3], b[3];
                 coulomb_pole_decomposition(screening, a, b);
                 coulomb_transport_coefficients(
@@ -5074,11 +5085,11 @@ void transport_do_ehs(const struct pumas_physics * physics,
                 const struct atomic_element * const element =
                     physics->element[component->element];
                 double kinetic0;
-                coulomb_frame_parameters(
-                    physics, kinetic, element->A, &kinetic0, data->fCM);
-                data->fspin = coulomb_spin_factor(physics, kinetic0);
-                coulomb_screening_parameters(physics, context, kinetic0,
-                    component->element, data->screening);
+                coulomb_frame_parameters(element->Z, element->A, physics->mass,
+                    kinetic, &kinetic0, data->fCM);
+                data->fspin = coulomb_spin_factor(physics->mass, kinetic0);
+                coulomb_screening_parameters(element->Z, element->A,
+                    physics->mass, kinetic0, data->screening);
                 coulomb_pole_decomposition(data->screening, data->a, data->b);
                 data->invlambda = component->fraction /
                     coulomb_wentzel_path(physics, kinetic0, element->Z,
@@ -6498,61 +6509,34 @@ static enum pumas_return material_index(const struct pumas_physics * physics,
 /**
  * Compute the atomic and nuclear screening parameters.
  *
- * @param Physics   Handle for physics tables.
- * @param context   The simulation context.
- * @param kinetic   The kinetic energy.
- * @param element   The scatterer atomic element.
+ * @param Z         The atomic charge number.
+ * @param A         The atomic mass number.
+ * @param mass      The projectile mass.
+ * @param kinetic   The projectile kinetic energy.
  * @param screening The computed screening parameters.
  *
- * The atomic screening parameter is computed according to Kuraev's
- * parameterisation for relativistic particles or using Moliere's one at low
- * energies.
+ * The atomic screening parameter is computed according to Moliere.
+ *
+ * XXX Document
  */
-void coulomb_screening_parameters(const struct pumas_physics * physics,
-    struct pumas_context * context, double kinetic, int element,
-    double * screening)
+void coulomb_screening_parameters(double Z, double A, double mass,
+    double kinetic, double * screening)
 {
         /* Nuclear screening. */
-        const double third = 1. / 3;
-        const double A13 = pow(physics->element[element]->A, third);
-        const double R1 = 1.02934 * A13 + 0.435;
-        const double R2 = 2.;
-        const double p2 = kinetic * (kinetic + 2. * physics->mass);
-        const double d = 5.8406E-02 / p2;
+        const double RN = 1.07E-15 * pow(A, 1. / 3.);
+        const double R1 = 0.962 * RN + 0.435E-15;
+        const double R2 = 2.E-15;
+        const double p2 = kinetic * (kinetic + 2. * mass);
+        const double d = 2.5 * HBAR_C * HBAR_C / p2;
         screening[1] = d / (R1 * R1);
         screening[2] = d / (R2 * R2);
 
-        /* Atomic Moliere screening with Coulomb correction from Kuraev et al.
-         * Phys. Rev. D 89, 116016 (2014). Valid for ultra-relativistic
-         * particles only.
-         */
-        struct atomic_element * e = physics->element[element];
-        const double etot = kinetic + physics->mass;
-        const double ZE = e->Z * etot;
+        /* Atomic screening a la Moliere. */
+        const double ZE = Z * (kinetic + mass);
         const double zeta2 = 5.3251346E-05 * (ZE * ZE) / p2;
-        double cK;
-        if (zeta2 > 1.) {
-                /* Let's perform the serie computation. */
-                int i, n = 10 + (int)(e->Z);
-                double f = 0.;
-                for (i = 1; i <= n; i++) f += zeta2 / (i * (i * i + zeta2));
-                cK = exp(f);
-        } else {
-                /* Let's use Kuraev's approximate expression. */
-                cK = exp(1. - 1. / (1. + zeta2) +
-                    zeta2 * (0.2021 + zeta2 * (0.0083 * zeta2 - 0.0369)));
-        }
-
-        /* Original Moliere's atomic screening, considered as a reference
-         * value at low energies.
-         */
-        const double cM = 1. + 3.34 * zeta2;
-
-        /* Atomic screening interpolation. */
-        double r = kinetic / etot;
-        r *= r;
-        const double c = r * cK + (1. - r) * cM;
-        screening[0] = 5.179587126E-12 * pow(e->Z, 2. / 3.) * c / p2;
+        const double R = 0.885 * BOHR_RADIUS * pow(Z, -1. / 3.);
+        screening[0] = 0.25 * HBAR_C * HBAR_C / (R * R * p2) *
+            (1.13 + 3.76 * zeta2);
 }
 
 /**
@@ -6608,42 +6592,41 @@ double coulomb_ehs_length(const struct pumas_physics * physics,
 /**
  * Compute the spin factor to the Coulomb DCS.
  *
- * @param Physics Handle for physics tables.
- * @param kinetic The kinetic energy.
+ * @param mass    The projectile mass.
+ * @param kinetic The projectile kinetic energy.
  * @return The spin factor.
  */
-double coulomb_spin_factor(const struct pumas_physics * physics, double kinetic)
+double coulomb_spin_factor(double mass, double kinetic)
 {
-        const double e = kinetic + physics->mass;
-        return kinetic * (e + physics->mass) / (e * e);
+        const double e = kinetic + mass;
+        return kinetic * (e + mass) / (e * e);
 }
 
 /**
  * Compute the parameters of the CM to the Lab frame transform for the
  * Coulomb DCS.
  *
- * @param Physics    Handle for physics tables.
- * @param kinetic    The kinetic energy.
- * @param Ma         The target mass, in atomic unit.
+ * @param Z          The atomic charge number.
+ * @param A          The atomic mass number.
+ * @param mass       The projectile mass.
+ * @param kinetic    The projectile kinetic energy.
  * @param kinetic0   The CM kinetic energy.
  * @param parameters The vector of Lorentz parameters (gamma, tau).
  */
-void coulomb_frame_parameters(const struct pumas_physics * physics,
-    double kinetic, double Ma, double * kinetic0, double * parameters)
+void coulomb_frame_parameters(double Z, double A, double mass, double kinetic,
+    double * kinetic0, double * parameters)
 {
-        Ma *= 0.931494; /* Convert from atomic unit to GeV. */
-        double M2 = physics->mass + Ma;
+        const double Ma = Z * PROTON_MASS + (A - Z) * NEUTRON_MASS; 
+        double M2 = mass + Ma;
         M2 *= M2;
         const double sCM12i = 1. / sqrt(M2 + 2. * Ma * kinetic);
-        parameters[0] = (kinetic + physics->mass + Ma) * sCM12i;
-        *kinetic0 =
-            (kinetic * Ma + physics->mass * (physics->mass + Ma)) * sCM12i -
-            physics->mass;
+        parameters[0] = (kinetic + mass + Ma) * sCM12i;
+        *kinetic0 = (kinetic * Ma + mass * (mass + Ma)) * sCM12i - mass;
         if (*kinetic0 < 1E-09) *kinetic0 = 1E-09;
-        const double etot = kinetic + physics->mass + Ma;
+        const double etot = kinetic + mass + Ma;
         const double betaCM2 =
-            kinetic * (kinetic + 2. * physics->mass) / (etot * etot);
-        double rM2 = physics->mass / Ma;
+            kinetic * (kinetic + 2. * mass) / (etot * etot);
+        double rM2 = mass / Ma;
         rM2 *= rM2;
         parameters[1] = sqrt(rM2 * (1. - betaCM2) + betaCM2);
 }
@@ -9102,11 +9085,11 @@ enum pumas_return compute_coulomb_parameters(struct pumas_physics * physics,
                 const struct atomic_element * const element =
                     physics->element[component->element];
                 double kinetic0;
-                coulomb_frame_parameters(
-                    physics, kinetic, element->A, &kinetic0, data->fCM);
-                data->fspin = coulomb_spin_factor(physics, kinetic0);
-                coulomb_screening_parameters(physics, NULL, kinetic0,
-                    component->element, data->screening);
+                coulomb_frame_parameters(element->Z, element->A,
+                    physics->mass, kinetic, &kinetic0, data->fCM);
+                data->fspin = coulomb_spin_factor(physics->mass, kinetic0);
+                coulomb_screening_parameters(element->Z, element->A,
+                    physics->mass, kinetic0, data->screening);
                 coulomb_pole_decomposition(data->screening, data->a, data->b);
                 coulomb_transport_coefficients(
                     1., data->fspin, data->screening, data->a, data->b, G);
@@ -9260,12 +9243,13 @@ enum pumas_return compute_coulomb_parameters(struct pumas_physics * physics,
                                 const struct atomic_element * const element =
                                     physics->element[component->element];
                                 double kinetic0;
-                                coulomb_frame_parameters(physics, kinetic,
-                                    element->A, &kinetic0, data->fCM);
-                                data->fspin =
-                                    coulomb_spin_factor(physics, kinetic0);
-                                coulomb_screening_parameters(physics, NULL,
-                                    kinetic0, component->element,
+                                coulomb_frame_parameters(element->Z, element->A,
+                                    physics->mass, kinetic, &kinetic0,
+                                    data->fCM);
+                                data->fspin = coulomb_spin_factor(
+                                    physics->mass, kinetic0);
+                                coulomb_screening_parameters(element->Z,
+                                    element->A, physics->mass, kinetic0,
                                     data->screening);
                                 coulomb_pole_decomposition(
                                     data->screening, data->a, data->b);
@@ -13080,6 +13064,52 @@ static double dcs_photonuclear_BBKS(
 #undef ALPHA
 }
 
+/**
+ * The elastic scattering differential cross section.
+ *
+ * @param Z       The charge number of the target atom.
+ * @param A       The mass number of the target atom.
+ * @param m       The projectile rest mass, in GeV
+ * @param K       The projectile initial kinetic energy.
+ * @param theta   The scattering angle, in rad.
+ * @return The corresponding value of the atomic DCS, in m^2 / rad.
+ *
+ * References:
+ *      XXX Document
+ */
+static double dcs_elastic(
+    double Z, double A, double m, double K, double theta)
+{
+        double kinetic0, screening[3], fCM[2];
+        coulomb_frame_parameters(Z, A, m, K, &kinetic0, fCM);
+        coulomb_screening_parameters(Z, A, m, kinetic0, screening);
+        const double fspin = coulomb_spin_factor(m, kinetic0);
+
+        const double c = cos(theta);
+        const double s = sin(theta);
+        const double gs = fCM[0] * s;
+        const double sd = sqrt(c * c + gs * gs * (1. - fCM[1] * fCM[1]));
+        const double cgs = c * c + gs * gs;
+        const double mu0 = 0.5 * (gs * gs * (1. + fCM[1]) + c * (c - sd)) / cgs;
+
+        const double num = fCM[0] * (c * fCM[1] + sd);
+        const double jac = num * num / (cgs * cgs * sd);
+
+        double dcs = 1.;
+        int i;
+        for (i = 0; i < sizeof(screening) / sizeof(screening[0]); i++) {
+                const double d = 1. / (screening[i] + mu0);
+                dcs *=  d * d;
+        }
+        dcs *= screening[1] * screening[1] * screening[2] * screening[2];
+
+        const double p02 = kinetic0 * (kinetic0 + 2. * m);
+        const double factor =
+            0.5 * ALPHA_EM * Z * (kinetic0 + m) * HBAR_C / p02;
+
+        return factor * factor * dcs * jac * (1. - fspin * mu0);
+}
+
 /** Data structure for caracterising a DCS model */
 struct dcs_entry {
         enum pumas_process process;
@@ -13129,12 +13159,12 @@ static enum pumas_return dcs_check_model(enum pumas_process process,
 
 /** Routine for checking a process index */
 static enum pumas_return dcs_check_process(
-    enum pumas_process process, struct error_context * error_)
+    enum pumas_process process, int n, struct error_context * error_)
 {
-        if ((process < 0) || (process >= 3)) {
+        if ((process < 0) || (process >= n)) {
                 return ERROR_VREGISTER(PUMAS_RETURN_INDEX_ERROR,
-                    "bad process (expected an index in [0, 3], got %u)",
-                    process);
+                    "bad process (expected an index in [0, %d], got %u)",
+                    n - 1, process);
         } else {
                 return PUMAS_RETURN_SUCCESS;
         }
@@ -13147,7 +13177,7 @@ enum pumas_return pumas_dcs_register(
         ERROR_INITIALISE(pumas_dcs_register);
 
         /* Check the process index */
-        if (dcs_check_process(process, error_) != PUMAS_RETURN_SUCCESS) {
+        if (dcs_check_process(process, 3, error_) != PUMAS_RETURN_SUCCESS) {
                 return ERROR_RAISE();
         }
 
@@ -13194,8 +13224,13 @@ enum pumas_return pumas_dcs_get(
         ERROR_INITIALISE(pumas_dcs_get);
 
         /* Check the process index */
-        if (dcs_check_process(process, error_) != PUMAS_RETURN_SUCCESS) {
+        if (dcs_check_process(process, 4, error_) != PUMAS_RETURN_SUCCESS) {
                 return ERROR_RAISE();
+        }
+
+        if (process == PUMAS_PROCESS_ELASTIC) {
+                *dcs = &dcs_elastic;
+                return PUMAS_RETURN_SUCCESS;
         }
 
         /* Set the default model if none provided */

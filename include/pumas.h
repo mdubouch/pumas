@@ -223,7 +223,9 @@ enum pumas_process {
         /** The e+e- pair production process */
         PUMAS_PROCESS_PAIR_PRODUCTION,
         /** The photonuclear process */
-        PUMAS_PROCESS_PHOTONUCLEAR
+        PUMAS_PROCESS_PHOTONUCLEAR,
+        /** The elastic (Coulomb) scattering process */
+        PUMAS_PROCESS_ELASTIC
 };
 
 /** Indices for PUMAS library constants. */
